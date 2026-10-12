@@ -1,0 +1,27 @@
+# ---- 上游原始包与构建产物：一律不入库（由 Actions 从上游拉取）----
+*.deb
+upstream.json
+dist/
+SHA256SUMS
+
+# ---- 精简流程的中间产物 ----
+extracted/
+extracted_trimmed/
+out/
+/tmp/
+wb-slim-*/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# ---- WorkBuddy 本地记忆（含本机路径等私密信息，勿公开）----
+.workbuddy/

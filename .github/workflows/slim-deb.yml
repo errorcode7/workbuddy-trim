@@ -1,0 +1,175 @@
+name: Slim WorkBuddy DEB
+
+# 定期从上游接口拉取最新 WorkBuddy Linux DEB，精简瘦身后发布到 Releases。
+#
+# 合规提示：本仓库为独立、非官方项目，与腾讯公司无任何隶属或授权关系。
+#   仓库本身不托管任何官方二进制，仅在运行时从腾讯官方渠道下载并做体积优化；
+#   处理不修改、不逆向、不绕过任何功能或授权逻辑。
+#   使用者须自行确认其下载、安装与分发行为符合腾讯的服务条款、EULA 及当地法律。
+#   完整条款见仓库根目录 DISCLAIMER.md。
+
+on:
+  schedule:
+    # 每天 03:00 UTC（北京时间 11:00）检查一次
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "即使已存在同版本 Release 也强制重建"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - ".github/workflows/**"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: slim-workbuddy-deb
+  cancel-in-progress: false
+
+jobs:
+  slim:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils xz-utils zstd dpkg dpkg-dev curl ca-certificates jq file
+
+      - name: 解析上游最新版本
+        id: up
+        run: |
+          set -euo pipefail
+          API='https://copilot.tencent.com/v2/update?platform=workbuddy-linux-x64-deb'
+          json=$(curl -fsSL --retry 3 --retry-delay 5 --max-time 60 "$API")
+          echo "$json" | jq .
+          version=$(jq -r '.version // .productVersion // empty' <<<"$json")
+          url=$(jq -r '.url // empty' <<<"$json")
+          sha=$(jq -r '.sha256hash // empty' <<<"$json")
+          if [ -z "$version" ] || [ -z "$url" ]; then
+            echo "::error::上游接口未返回 version/url"; exit 1
+          fi
+          {
+            echo "version=$version"
+            echo "url=$url"
+            echo "sha256=$sha"
+          } >> "$GITHUB_OUTPUT"
+          echo "$json" > upstream.json
+          echo "上游版本：$version"
+
+      - name: 检查该版本是否已发布
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="v${{ steps.up.outputs.version }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "已存在 Release $tag，本次跳过构建。"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "未发布 $tag，开始构建。"
+          fi
+
+      - name: 下载原始 deb
+        if: steps.check.outputs.exists == 'false' || inputs.force
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 5 --connect-timeout 30 \
+            -o upstream.deb "${{ steps.up.outputs.url }}"
+          ls -l upstream.deb
+
+      - name: 校验下载文件（sha256 / 结构 / 版本一致性）
+        if: steps.check.outputs.exists == 'false' || inputs.force
+        run: |
+          set -euo pipefail
+          actual=$(sha256sum upstream.deb | awk '{print $1}')
+          expected="${{ steps.up.outputs.sha256 }}"
+          echo "实际 sha256  : $actual"
+          echo "接口 sha256hash: $expected"
+          if [ -n "$expected" ] && [ "$actual" != "$expected" ]; then
+            echo "::warning title=sha256 不一致::上游接口的 sha256hash 字段与所服务文件不一致（已知上游问题），已跳过该字段校验，改用结构与版本校验。"
+          fi
+
+          # 必须是合法 deb
+          dpkg-deb --info upstream.deb >/dev/null
+
+          # 版本交叉校验：接口 version(5.5.6.38337834) 以 deb Version(5.5.6) 开头
+          ctl_ver=$(dpkg-deb -f upstream.deb Version)
+          echo "deb Version=$ctl_ver / API version=${{ steps.up.outputs.version }}"
+          case "${{ steps.up.outputs.version }}" in
+            "$ctl_ver"*) echo "版本一致 ✔" ;;
+            *) echo "::error::上游版本与 deb 元数据不一致"; exit 1 ;;
+          esac
+
+      - name: 精简并重新打包
+        if: steps.check.outputs.exists == 'false' || inputs.force
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          out="dist/WorkBuddy-linux-x64-deb-${{ steps.up.outputs.version }}-trimmed.deb"
+          python3 scripts/slim_workbuddy.py upstream.deb "$out" \
+            --workdir "$RUNNER_TEMP/wb-slim" \
+            --compress xz
+          # 原始包占空间，构建完即可删除
+          rm -f upstream.deb
+          # 生成校验清单
+          (cd dist && sha256sum "$(basename "$out")" > SHA256SUMS)
+          ls -lh dist/
+
+      - name: 写入执行摘要
+        if: steps.check.outputs.exists == 'false' || inputs.force
+        run: |
+          {
+            echo "## WorkBuddy DEB 精简结果"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "| :--- | :--- |"
+            echo "| 上游版本 | \`${{ steps.up.outputs.version }}\` |"
+            echo "| 上游 URL | ${{ steps.up.outputs.url }} |"
+            echo ""
+            ls -lh dist/ | sed 's/^/    /'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传构建产物（工作流留档）
+        if: steps.check.outputs.exists == 'false' || inputs.force
+        uses: actions/upload-artifact@v4
+        with:
+          name: workbuddy-deb-trimmed-${{ steps.up.outputs.version }}
+          path: dist/*
+          retention-days: 14
+
+      - name: 发布 Release
+        if: steps.check.outputs.exists == 'false' || inputs.force
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UP_VERSION: ${{ steps.up.outputs.version }}
+          UP_URL: ${{ steps.up.outputs.url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/release-notes.md"
+          {
+            echo "由 [Slim WorkBuddy DEB]($RUN_URL) 自动构建。"
+            echo
+            echo "- 上游版本：\`$UP_VERSION\`"
+            echo "- 上游地址：$UP_URL"
+            echo
+            echo "本包为对官方 deb 的重打包精简版：以软链接复用系统 nodejs / python3 / ripgrep / libvulkan1，"
+            echo "并移除跨平台残留、多余语言包与调试符号。"
+            echo "安装前请确保系统已具备上述依赖（deb 已声明 Depends，apt 会自动处理）。"
+          } > "$notes"
+
+          gh release create "v$UP_VERSION" dist/* upstream.json \
+            --title "WorkBuddy Linux DEB $UP_VERSION (trimmed)" \
+            --notes-file "$notes"
+          echo "已发布：v$UP_VERSION"
