@@ -20,20 +20,77 @@ GET https://copilot.tencent.com/v2/update?platform=workbuddy-linux-x64-deb
 拿到最新版本的下载地址 → 校验 → 精简重打包 → 发布为 Release（tag = `v<version>`）。
 已发布过的版本会跳过，不会重复构建。
 
-## 精简策略（四大支柱）
+## 精简范围与策略（四大支柱）
 
-1. **软链复用系统运行时** —— 删除官方自带的 Node.js / Python / ripgrep / libvulkan，
-   改为软链到系统 `/usr/bin/node`、`/usr/bin/python3`、`/usr/bin/rg`、系统 `libvulkan.so.1`
-   （节省约 600 MB）。精简包通过 `Depends` 声明了对这些系统包的依赖。
-2. **剔除非 Linux-x64 残留** —— koffi / node-pty / weixinpay / cli 里的 darwin、win32、
-   arm、musl 等异构产物全部删除。
-3. **裁语言包与文档** —— 语言包只留中英文；15 MB 的 `LICENSES.chromium.html` 换为占位；
-   删除所有 `*.map`、C++ 源码与编译中间产物。
-4. **strip 二进制** —— `editor_sdk` 及所有 `.node` 原生模块去调试符号（约 -34 MB）。
+本项目遵循**“避免系统已有组件重复、剔除跨平台与构建残留、精简冗余语言与文档、去调试符号”**原则，在 100% 保持应用功能完整的前提下实现体积减半。
 
-> **核心准则**：只做「软链 + 删文件」，**绝不手改 `app.asar` 主体**。
-> 手动重写 asar 头部会破坏 Electron 的 Pickle 协议，导致启动崩溃
-> `Failed to parse header`。详见 `docs/WORKBUDDY_DEB_SLIMMING_GUIDE.md` §2。
+### 1. 精简范围与收益账单
+
+| 精简维度 | 官方原版状态 | 精简处理方案 | 体积变化 / 收益 |
+| :--- | :--- | :--- | :--- |
+| **Node.js 运行时** | 自带 Node v22 运行时树与 65MB C++ 头文件 | 清空整目录，软链至系统 `/usr/bin/node` | **203 MB $\to$ 0 MB** |
+| **Python 运行时** | 自带 Python 3.13 解释器、239MB 调试动态库与 Tcl/Tk | 清空整目录，软链至系统 `/usr/bin/python3` 与 `pip3` | **399 MB $\to$ 0 MB** |
+| **Ripgrep 检索工具** | 自带独立 `rg` 二进制文件 | 软链至系统 `/usr/bin/rg` | **12 MB $\to$ 0 MB** |
+| **Vulkan Loader** | 自带 `libvulkan.so.1` 动态库 | 软链至系统 `/usr/lib/x86_64-linux-gnu/libvulkan.so.1` | **2.2 MB $\to$ 0 MB** |
+| **多语言本地化包** | 56 种语言 `.pak` 文件（含大量生僻小语种） | **仅保留中英文**（`zh-CN`, `zh-TW`, `en-US`, `en-GB`），移除其余 51 个小语种 | **42 MB $\to$ 2.5 MB**（省 ~39.5 MB） |
+| **开源许可证网页** | 15.27 MB 静态纯 HTML 展示页 (`LICENSES.chromium.html`) | 替换为标准化简要版权声明 HTML（203 字节） | **15.3 MB $\to$ 203 B**（省 ~15.2 MB） |
+| **源码映射 SourceMap** | 包含 379 个前端/Node 调试映射文件 (`*.map`) | 生产环境安全移除全部 `*.map` | **2.3 MB $\to$ 0 MB** |
+| **异构跨平台残留** | 混入 Windows / macOS / ARM / BSD / musl 产物 | 彻底清除所有非 Linux-x64 平台文件与预编译库 | **节省 ~50 MB** |
+| **源码与编译中间件** | 包含 C/C++ 源码（如 `sqlite3.c`）、头文件与 `.o` / `.a` 静态库 | 移除编译残留与开发源码，去重重复的原生 `.node` 副本 | **节省 ~7 MB** |
+| **二进制调试符号** | `editor_sdk` 及原生模块未执行 strip | 执行 `strip --strip-unneeded` 去除符号表 | **节省 ~35 MB** |
+
+---
+
+### 2. 精简详细范围清单
+
+#### 模块一：复用系统运行时与基础依赖（杜绝 deb 内重复打包）
+- **`resources/runtime/node/`**：官方打包了完整的 Node.js 安装树。精简流水线清空该目录（移除全部自带动态库、文档与 65MB 的 `include/node` 开发头文件），仅保留 `bin/node` 与 `bin/nodejs` 软链指向 `/usr/bin/node`。
+- **`resources/runtime/python/`**：官方打包了全套 Python 3.13 解释器、未 strip 的 239MB `libpython3.13.so.1.0` 调试库、109MB `python3.13` 二进制以及 Tcl/Tk 依赖。精简流水线清空该目录，仅建立 `bin/python3` $\to$ `/usr/bin/python3`，`bin/python` $\to$ `python3`，`bin/pip3` $\to$ `/usr/bin/pip3`，`bin/pip` $\to$ `pip3` 软链接。
+- **`cli/vendor/ripgrep/*/rg`**：替换为指向系统 `/usr/bin/rg` 的软链接。
+- **`libvulkan.so.1`**：替换为指向系统 `/usr/lib/x86_64-linux-gnu/libvulkan.so.1` 的软链接。
+- **DEB 依赖自动声明**：在 `DEBIAN/control` 的 `Depends` 字段自动追加 `nodejs, python3, python3-pip, ripgrep, libvulkan1`，由 APT 自动满足系统组件。
+
+#### 模块二：剔除非 Linux-x64 的跨平台异构残留
+- **`node_modules/koffi`**：官方打包了 18 种系统架构。精简后**仅保留 `build/koffi/linux_x64/`**，彻底删除其余 17 个异构平台（`darwin_arm64`, `darwin_x64`, `win32_arm64`, `win32_ia32`, `win32_x64`, `freebsd_arm64`, `freebsd_ia32`, `freebsd_x64`, `openbsd_ia32`, `openbsd_x64`, `linux_arm64`, `linux_armhf`, `linux_ia32`, `linux_loong64`, `linux_riscv64d`, `musl_arm64`, `musl_x64`）。
+- **`node-pty` 与 `@lydell/node-pty-*`**：删除 `prebuilds/darwin-*`, `prebuilds/win32-*`, `prebuilds/linux-arm64`，仅保留 `linux-x64`。
+- **`weixinpay` 插件**：删除 `prebuilds/darwin-*`, `prebuilds/win32-*`。
+- **`cli/bin/native/`**：删除 `win32-arm64`, `win32-x64` 以及 Windows 进程抑制脚本（`*.bunfig.toml`, `*.cjs`）。
+- **`cli/vendor/`**：删除 macOS 专用工具 `toybox-macos`, `zsh-macos`，删除 `shim/native/darwin-*`, `shim/native/win32-*`。
+- **系统专属与源码**：删除 macOS 专用监控模块 `node_modules/fsevents`，删除 `qimei-node/src/win` 和 `src/mac`。
+
+#### 模块三：多语言、无用文档与开发产物清理
+- **本地化语言包 (`locales/`)**：
+  - **保留白名单**：`zh-CN.pak`（简体中文）、`zh-TW.pak`（繁体中文）、`en-US.pak`（美式英文）、`en-GB.pak`（英式英文）。
+  - **裁减清单**：删除泰米尔语、马拉雅拉姆语、卡纳达语、印地语、泰语、希腊语、波斯语、阿拉伯语等共计 51 个非中英小语种 `.pak` 文件（释放近 40 MB 空间）。
+- **静态许可文档 (`LICENSES.chromium.html`)**：官方自带的纯展示 HTML 体积高达 15.27 MB，替换为合规简短声明，释放 15 MB 静态空间。
+- **Source Map 映射**：删除 `app.asar.unpacked` 内所有 `*.map` 前端调试文件（379 个，2.32 MB）。
+- **编译残留与开发源码**：
+  - 删除 `better-sqlite3` 与 `koffi` 内部的 `src/`、`deps/`（包括 `sqlite3.c`, `sqlite3.h` 等编译源码/头文件）、`doc/`。
+  - 删除构建目标中间件 `better-sqlite3/build/Release/obj/`, `obj.target/`, `sqlite3.a` 静态库（~20 MB 编译残留）。
+- **原生模块副本去重**：`better-sqlite3` 在 `bin/linux-x64-136/` 与 `build/Release/` 打包了两份相同的 `better_sqlite3.node`，替换为相对软链接，消除一份副本（省 2 MB）。
+
+#### 模块四：二进制与原生模块 Strip（去符号表）
+对保留的 ELF 可执行文件与所有 `.node` 原生插件执行 `strip --strip-unneeded`：
+- `editor_sdk`（文档 AI 引擎核心）：从 225.15 MB $\to$ 192.93 MB（**单项缩减 32.2 MB**）；
+- `betterleaks`、`sandbox-center`、`sandbox-cli`、`sandbox-cli-gc`、`wb-bridge`；
+- 所有 `.node` 原生模块插件。
+
+---
+
+### 3. 安全边界与保留原则（不精简项）
+
+为了保证应用在各种运行场景下的健壮性与功能 100% 完整，以下内容**明确保持原样，绝不裁减**：
+
+1. **绝对不篡改 `app.asar` 主体**：
+   - 历史踩坑教训表明，手动解包并重构 `app.asar` 极易破坏 Chromium Pickle 二进制 Header 规范（例如末尾多写入补齐字节 `\x00`），触发 Electron 原生崩溃：
+     `[ERROR:electron/shell/common/asar/archive.cc:260] Failed to parse header`。
+   - 所有精简均在 `resources/runtime/`、`resources/app.asar.unpacked/`、`locales/` 和顶层二进制中进行，严禁破坏 ASAR 归档。
+2. **不全局粗暴删除 `*.md` 文档**：
+   - WorkBuddy 的插件与内置 Agent Skills（如 `skill-creator`, `tencent-docx`, `sheetagent` 等）包含大量供 AI 智能体工作流执行读取的 system prompt 与操作规约（Markdown 格式），误删将导致智能体工作流异常，因此脚本仅清理开发包源码目录的文档，完整保留业务 Skills Markdown。
+3. **保留底层图形与音视频兼容库**：
+   - `libvk_swiftshader.so`（软件 Vulkan 渲染，纯无头服务器或虚拟机保底兼容必需）；
+   - `libffmpeg.so`（Chromium 定制流媒体解复用库）；
+   - `icudtl.dat`（Unicode 国际化数据资产包）。
 
 ## 本地使用
 
